@@ -1,0 +1,128 @@
+name: Pruebas de API (Newman + k6)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Compilar API .NET
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Compilar
+        run: dotnet build src/BancoApi/BancoApi.csproj -c Release
+
+  # ------------- Pruebas funcionales con Newman (Victor) -------------
+  newman:
+    name: Pruebas funcionales con Newman
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Iniciar la API
+        run: |
+          dotnet run --project src/BancoApi -c Release --urls http://localhost:5000 > api.log 2>&1 &
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:5000/health > /dev/null; then echo "API lista"; exit 0; fi
+            sleep 2
+          done
+          cat api.log; exit 1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Instalar Newman
+        run: npm install -g newman newman-reporter-htmlextra
+      - name: Ejecutar la colección de Postman
+        run: |
+          mkdir -p site/newman
+          newman run tests/postman/banco-api.postman_collection.json \
+            -e tests/postman/local.postman_environment.json \
+            --reporters cli,htmlextra,junit \
+            --reporter-htmlextra-export site/newman/index.html \
+            --reporter-htmlextra-title "Banco API - Pruebas funcionales con Newman" \
+            --reporter-junit-export site/newman/resultados.xml
+      - name: Guardar reporte
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reporte-newman
+          path: site
+
+  # ------------- Pruebas de carga con k6 (Gerald) -------------
+  k6:
+    name: Pruebas de carga con k6
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Iniciar la API
+        run: |
+          dotnet run --project src/BancoApi -c Release --urls http://localhost:5000 > api.log 2>&1 &
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:5000/health > /dev/null; then echo "API lista"; exit 0; fi
+            sleep 2
+          done
+          cat api.log; exit 1
+      - name: Instalar k6
+        uses: grafana/setup-k6-action@v1
+      - name: Ejecutar la prueba de carga
+        env:
+          BASE_URL: http://localhost:5000
+          K6_WEB_DASHBOARD: 'true'
+          K6_WEB_DASHBOARD_EXPORT: site/k6/index.html
+        run: |
+          mkdir -p site/k6
+          k6 run --summary-export=site/k6/resumen.json tests/k6/carga.js
+      - name: Guardar reporte
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reporte-k6
+          path: site
+
+  # ------------- Publicación en la nube (GitHub Pages) -------------
+  publicar:
+    name: Publicar reportes en GitHub Pages
+    runs-on: ubuntu-latest
+    needs: [ newman, k6 ]
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: site
+          merge-multiple: true
+      - name: Página de inicio
+        run: cp docs/index.html site/index.html
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - name: Desplegar
+        id: deployment
+        uses: actions/deploy-pages@v4
