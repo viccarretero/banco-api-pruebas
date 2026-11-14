@@ -1,0 +1,5 @@
+bin/
+obj/
+site/
+node_modules/
+.vs/
